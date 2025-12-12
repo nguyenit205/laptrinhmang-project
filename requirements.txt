@@ -1,0 +1,21 @@
+# Auto-generated requirements
+# Install: pip install -r requirements.txt
+
+# GUI Framework
+customtkinter==5.2.1
+
+# Image Processing
+Pillow==10.1.0
+opencv-python==4.8.1.78
+
+# QR Code
+qrcode==7.4.2
+
+# Array Processing
+numpy==1.24.3
+
+# Cryptography
+cryptography==41.0.7
+
+# Password Hashing
+bcrypt==4.1.2
