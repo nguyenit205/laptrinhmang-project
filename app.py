@@ -8,6 +8,7 @@ import uuid
 import socket
 import threading
 import ssl
+import queue
 import numpy as np
 import customtkinter as ctk
 from customtkinter import filedialog
@@ -98,6 +99,10 @@ class App(ctk.CTk):
         self.incoming_files = {}
         self.local_ip = "127.0.0.1"
         
+        # ✅ Queue system for file transfers (prevents race conditions)
+        self.send_queue = queue.Queue()
+        self.receive_queue = queue.Queue()
+        
         # Networking
         self.tcp_server = None
         self.tcp_client = None
@@ -109,6 +114,58 @@ class App(ctk.CTk):
             self.show_login_view()
         else:
             self._setup_main_app()
+    
+    # ==================== Queue Processors ====================
+    
+    def _start_queue_processors(self):
+        """Start background workers for send/receive queues"""
+        threading.Thread(target=self._process_send_queue, daemon=True).start()
+        threading.Thread(target=self._process_receive_queue, daemon=True).start()
+    
+    def _process_send_queue(self):
+        """Process outgoing files"""
+        while True:
+            try:
+                item = self.send_queue.get(timeout=0.1)
+                if item is None:
+                    break
+                
+                path, ip, size = item
+                filename = os.path.basename(path)
+                file_id = str(uuid.uuid4())
+                
+                try:
+                    self.tcp_client.send_file(path, ip, LOCAL_PORT)
+                    self.after(0, self.add_file_row, "You sent", file_id, filename, size)
+                except Exception as e:
+                    self.after(0, self.add_chat_row, f"[SYSTEM] Send error: {e}", True)
+                
+                self.send_queue.task_done()
+                
+            except queue.Empty:
+                continue
+    
+    def _process_receive_queue(self):
+        """Process incoming files"""
+        while True:
+            try:
+                item = self.receive_queue.get(timeout=0.1)
+                if item is None:
+                    break
+                
+                data, filename, addr = item
+                file_id = str(uuid.uuid4())
+                
+                # Store file in memory
+                self.incoming_files[file_id] = {"filename": filename, "bytes": data}
+                
+                # Update UI
+                self.after(0, self.add_file_row, f"{addr[0]} sent", file_id, filename, len(data))
+                
+                self.receive_queue.task_done()
+                
+            except queue.Empty:
+                continue
     
     # ==================== Auth Views ====================
     
@@ -192,6 +249,7 @@ class App(ctk.CTk):
         success, message = self.auth.login(username, password)
         
         if success:
+            # Check keypair existence
             pub_path = os.path.join("keys", f"{username}_public.pem")
             priv_path = os.path.join("keys", f"{username}_private.enc")
             
@@ -249,12 +307,17 @@ class App(ctk.CTk):
         except:
             self.local_ip = "127.0.0.1"
         
+        # Start TCP server
         if self.tcp_server is None:
             self.tcp_server = TcpChatServer("0.0.0.0", LOCAL_PORT, self.on_tcp_text, self.on_tcp_file)
             self.tcp_server.start()
         
+        # Start TCP client
         if self.tcp_client is None:
             self.tcp_client = TcpChatClient()
+        
+        # ✅ Start queue processors
+        self._start_queue_processors()
         
         self._setup_sidebar()
         self._setup_main_frame()
@@ -630,9 +693,11 @@ class App(ctk.CTk):
             self.add_chat_row(f"[SYSTEM] Error: {e}", True)
     
     def on_tcp_text(self, text, addr):
+        """Callback when text received"""
         self.after(0, self.add_chat_row, f"{addr[0]}: {text}")
     
     def send_tcp_file(self):
+        """Add file to send queue - non-blocking"""
         ip = self.chat_ip_entry.get().strip()
         if not ip:
             self.add_chat_row("[SYSTEM] Enter IP", True)
@@ -645,20 +710,23 @@ class App(ctk.CTk):
         try:
             size = os.path.getsize(path)
             if size > TCP_MAX_FILE_SIZE:
-                self.add_chat_row("[SYSTEM] File too large (max 20MB)", True)
+                self.add_chat_row(f"[SYSTEM] File too large (max 20MB)", True)
                 return
             
-            self.tcp_client.send_file(path, ip, LOCAL_PORT)
-            self.add_file_row("You sent", str(uuid.uuid4()), os.path.basename(path), size)
+            # ✅ Add to send queue (instant, non-blocking)
+            self.send_queue.put((path, ip, size))
+            self.add_chat_row(f"[SYSTEM] Sending {os.path.basename(path)}...", True)
+            
         except Exception as e:
             self.add_chat_row(f"[SYSTEM] Error: {e}", True)
     
     def on_tcp_file(self, data, filename, addr):
-        file_id = str(uuid.uuid4())
-        self.incoming_files[file_id] = {"filename": filename, "bytes": data}
-        self.after(0, self.add_file_row, f"{addr[0]} sent", file_id, filename, len(data))
+        """Callback when file received - add to queue"""
+        # ✅ Add to receive queue (instant, no UI blocking)
+        self.receive_queue.put((data, filename, addr))
     
     def download_incoming_file(self, file_id):
+        """Download received file"""
         info = self.incoming_files.get(file_id)
         if not info:
             self.add_chat_row("[SYSTEM] File not found", True)
@@ -669,6 +737,6 @@ class App(ctk.CTk):
             try:
                 with open(path, "wb") as f:
                     f.write(info["bytes"])
-                self.add_chat_row(f"[SYSTEM] Saved to: {path}", True)
+                self.add_chat_row(f"[SYSTEM] Saved: {path}", True)
             except Exception as e:
                 self.add_chat_row(f"[SYSTEM] Error: {e}", True)

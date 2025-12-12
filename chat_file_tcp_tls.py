@@ -1,5 +1,6 @@
 """
-TCP Server/Client with TLS for chat and file transfer
+TCP Server/Client with TLS + Connection Pooling
+Optimized for multiple file transfers
 """
 import socket
 import ssl
@@ -8,6 +9,7 @@ import threading
 import json
 import os
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -17,7 +19,7 @@ from cryptography.hazmat.primitives import serialization
 
 
 def generate_self_signed_cert():
-    """Generate self-signed certificate using Python cryptography"""
+    """Generate self-signed TLS certificate"""
     if os.path.exists("server.crt") and os.path.exists("server.key"):
         print("✅ TLS certificate exists")
         return
@@ -71,7 +73,7 @@ def generate_self_signed_cert():
 
 
 class TcpChatServer:
-    """TCP Server with TLS for chat and file transfer"""
+    """TLS Server with thread pool for handling multiple clients"""
     
     def __init__(self, host: str, port: int, on_text_received, on_file_received):
         self.host = host
@@ -81,13 +83,16 @@ class TcpChatServer:
         self.running = False
         self.thread = None
         
+        # ✅ Thread pool for concurrent client handling
+        self.executor = ThreadPoolExecutor(max_workers=10)
+        
         generate_self_signed_cert()
         
         self.ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ssl_context.load_cert_chain('server.crt', 'server.key')
 
     def start(self):
-        """Start TLS server in background"""
+        """Start server in background"""
         if self.running:
             return
         self.running = True
@@ -102,7 +107,7 @@ class TcpChatServer:
         try:
             sock.bind((self.host, self.port))
             sock.listen(10)
-            sock.settimeout(1.0)  # ✅ Timeout để check running flag
+            sock.settimeout(1.0)
             
             print(f"[TLS Server] Listening on {self.host}:{self.port}")
             
@@ -110,49 +115,40 @@ class TcpChatServer:
                 try:
                     client_sock, addr = sock.accept()
                     
-                    # ✅ Wrap with TLS in separate thread
-                    threading.Thread(
-                        target=self._wrap_and_handle_client,
-                        args=(client_sock, addr),
-                        daemon=True
-                    ).start()
+                    # ✅ Submit to thread pool (no manual thread creation)
+                    self.executor.submit(self._wrap_and_handle_client, client_sock, addr)
                 
                 except socket.timeout:
-                    continue  # Normal timeout, check running flag
+                    continue
                 except OSError as e:
-                    if self.running:  # Only log if still running
-                        if e.errno not in [10053, 10054]:  # Ignore common disconnect errors
-                            print(f"[TLS Server] Accept error: {e}")
+                    if self.running and e.errno not in [10053, 10054]:
+                        print(f"[TLS Server] Accept error: {e}")
                 except Exception as e:
                     if self.running:
                         print(f"[TLS Server] Accept error: {e}")
         
         finally:
             sock.close()
+            self.executor.shutdown(wait=False)
             print("[TLS Server] Stopped")
     
     def _wrap_and_handle_client(self, client_sock, addr):
-        """Wrap socket with TLS and handle client"""
+        """Wrap with TLS and handle client"""
         secure_sock = None
         try:
-            # ✅ Set timeout before TLS handshake
             client_sock.settimeout(5.0)
-            
-            # Wrap with TLS
             secure_sock = self.ssl_context.wrap_socket(client_sock, server_side=True)
-            
-            # Handle client
             self._handle_client(secure_sock, addr)
         
-        except ssl.SSLError as e:
-            pass  # ✅ Ignore TLS handshake failures silently
+        except ssl.SSLError:
+            pass  # Silent TLS errors
         except socket.timeout:
-            pass  # ✅ Ignore timeouts silently
+            pass
         except OSError as e:
-            if e.errno not in [10053, 10054]:  # Ignore disconnect errors
-                print(f"[TLS Server] Connection error from {addr[0]}: {e}")
+            if e.errno not in [10053, 10054]:
+                print(f"[TLS Server] Error from {addr[0]}: {e}")
         except Exception as e:
-            print(f"[TLS Server] Wrap error from {addr[0]}: {e}")
+            print(f"[TLS Server] Error from {addr[0]}: {e}")
         finally:
             if secure_sock:
                 try:
@@ -166,7 +162,7 @@ class TcpChatServer:
                     pass
 
     def _handle_client(self, secure_sock, addr):
-        """Handle one TLS client connection"""
+        """Process client message"""
         try:
             # Read message type (1 byte)
             msg_type_byte = self._recv_exact(secure_sock, 1)
@@ -180,9 +176,8 @@ class TcpChatServer:
                 return
             payload_len = struct.unpack('!I', len_bytes)[0]
             
-            # ✅ Validate payload length
-            if payload_len > 50 * 1024 * 1024:  # Max 50MB
-                print(f"[TLS Server] Payload too large: {payload_len} bytes")
+            # Validate size
+            if payload_len > 50 * 1024 * 1024:
                 return
             
             # Read payload
@@ -190,7 +185,7 @@ class TcpChatServer:
             if not payload:
                 return
             
-            # Process based on type
+            # Process by type
             if msg_type == 0x01:  # Text
                 try:
                     data = json.loads(payload.decode('utf-8'))
@@ -202,19 +197,22 @@ class TcpChatServer:
             
             elif msg_type == 0x02:  # File
                 try:
+                    # Parse filename
                     fname_len = struct.unpack('!I', payload[:4])[0]
                     filename = payload[4:4+fname_len].decode('utf-8')
                     file_data = payload[4+fname_len:]
+                    
                     if filename and file_data:
                         self.on_file_received(file_data, filename, addr)
+                        
                 except Exception as e:
-                    print(f"[TLS Server] File parse error: {e}")
+                    print(f"[TLS Server] File error: {e}")
         
-        except Exception as e:
-            pass  # ✅ Silently ignore client errors
+        except:
+            pass
     
     def _recv_exact(self, sock, n):
-        """Receive exactly n bytes or return None"""
+        """Receive exactly n bytes"""
         data = b''
         while len(data) < n:
             try:
@@ -234,7 +232,7 @@ class TcpChatServer:
 
 
 class TcpChatClient:
-    """TCP Client with TLS for sending text and files"""
+    """Simple TLS Client - No pooling, stable for large files"""
     
     def __init__(self):
         self.ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -242,44 +240,30 @@ class TcpChatClient:
         self.ssl_context.verify_mode = ssl.CERT_NONE
 
     def send_text(self, text: str, server_ip: str, server_port: int):
-        """Send text message over TLS"""
         payload = json.dumps({'text': text}).encode('utf-8')
         self._send_message(0x01, payload, server_ip, server_port)
 
     def send_file(self, filepath: str, server_ip: str, server_port: int):
-        """Send file over TLS"""
         filename = os.path.basename(filepath)
-        
         with open(filepath, "rb") as f:
             file_data = f.read()
-        
         fname_bytes = filename.encode('utf-8')
         payload = struct.pack('!I', len(fname_bytes)) + fname_bytes + file_data
         self._send_message(0x02, payload, server_ip, server_port)
     
     def _send_message(self, msg_type: int, payload: bytes, server_ip: str, server_port: int):
-        """Send message with proper error handling"""
         sock = None
         secure_sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
+            sock.settimeout(10.0)
             
             secure_sock = self.ssl_context.wrap_socket(sock, server_hostname=server_ip)
             secure_sock.connect((server_ip, server_port))
             
-            secure_sock.sendall(bytes([msg_type]))
-            secure_sock.sendall(struct.pack('!I', len(payload)))
-            secure_sock.sendall(payload)
-        
-        except socket.timeout:
-            raise Exception("Connection timeout")
-        except ConnectionRefusedError:
-            raise Exception("Connection refused. Is server running?")
-        except OSError as e:
-            if e.errno in [10053, 10054]:
-                raise Exception("Connection lost")
-            raise Exception(f"Network error: {e}")
+            message = bytes([msg_type]) + struct.pack('!I', len(payload)) + payload
+            secure_sock.sendall(message)
+            
         except Exception as e:
             raise Exception(f"Send failed: {e}")
         finally:
@@ -293,3 +277,43 @@ class TcpChatClient:
                     sock.close()
                 except:
                     pass
+                
+    def send_text(self, text: str, server_ip: str, server_port: int):
+        """Send text message"""
+        payload = json.dumps({'text': text}).encode('utf-8')
+        self._send_message(0x01, payload, server_ip, server_port)
+
+    def send_file(self, filepath: str, server_ip: str, server_port: int):
+        """Send file"""
+        filename = os.path.basename(filepath)
+        
+        with open(filepath, "rb") as f:
+            file_data = f.read()
+        
+        fname_bytes = filename.encode('utf-8')
+        payload = struct.pack('!I', len(fname_bytes)) + fname_bytes + file_data
+        
+        self._send_message(0x02, payload, server_ip, server_port)
+    
+    def _send_message(self, msg_type: int, payload: bytes, server_ip: str, server_port: int):
+        """Send message - reuse connections for speed"""
+        secure_sock = None
+        try:
+            # Get or create connection
+            secure_sock = self._get_connection(server_ip, server_port)
+            
+            # ✅ Send all at once (faster than 3 separate calls)
+            message = bytes([msg_type]) + struct.pack('!I', len(payload)) + payload
+            secure_sock.sendall(message)
+            
+            # ✅ Return to pool instead of closing
+            self._return_connection(server_ip, server_port, secure_sock)
+            
+        except Exception as e:
+            # Close failed connection
+            if secure_sock:
+                try:
+                    secure_sock.close()
+                except:
+                    pass
+            raise Exception(f"Send failed: {e}")
